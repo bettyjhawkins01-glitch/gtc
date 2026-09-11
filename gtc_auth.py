@@ -1,12 +1,10 @@
 """
-GetContact authentication/session client.
+Safe GetContact session client.
 
-Important:
-- Audience never logs in.
-- A single admin-owned GetContact session is shared by the bot.
-- OTP delivery channel is ultimately controlled by GetContact's server.
-  We send a WhatsApp preference hint; if the upstream API ignores it,
-  delivery may still fall back to SMS/app.
+- Generates a local device profile for app state/testing only.
+- DOES NOT call register-device or attempt to bypass GetContact authentication.
+- Admin can save a valid session token obtained through an official login flow.
+- Audience reuses that stored admin session.
 """
 import uuid
 import random
@@ -31,51 +29,31 @@ GTC_HEADERS_BASE = {
 }
 
 ANDROID_DEVICES = [
-    {"brand": "samsung", "model": "SM-A325F", "product": "a32", "device": "a32", "android": "12"},
-    {"brand": "samsung", "model": "SM-A515F", "product": "a51", "device": "a51", "android": "11"},
-    {"brand": "xiaomi", "model": "2201116SG", "product": "lisa", "device": "lisa", "android": "12"},
-    {"brand": "OPPO", "model": "CPH2269", "product": "OP4F7F", "device": "OP4F7F", "android": "11"},
-    {"brand": "vivo", "model": "V2120", "product": "V2120", "device": "V2120", "android": "12"},
+    {"brand": "samsung", "model": "SM-A325F", "android": "12", "sdk": "31"},
+    {"brand": "samsung", "model": "SM-A515F", "android": "11", "sdk": "30"},
+    {"brand": "xiaomi", "model": "2201116SG", "android": "12", "sdk": "31"},
+    {"brand": "OPPO", "model": "CPH2269", "android": "11", "sdk": "30"},
+    {"brand": "vivo", "model": "V2120", "android": "12", "sdk": "31"},
 ]
-ANDROID_SDK = {"10": "29", "11": "30", "12": "31", "13": "33", "14": "34"}
 
 
 def _rand_hex(n):
     return "".join(random.choices("0123456789abcdef", k=n))
 
 
-def _rand_digits(n):
-    return "".join(random.choices(string.digits, k=n))
-
-
-def _rand_upper(n):
-    return "".join(random.choices("0123456789ABCDEF", k=n))
-
-
 def generate_device():
-    dev = random.choice(ANDROID_DEVICES)
-    av = dev["android"]
-    fcm_chars = string.ascii_letters + string.digits + "-_"
+    d = random.choice(ANDROID_DEVICES)
     return {
         "device_id": str(uuid.uuid4()),
         "android_id": _rand_hex(16),
-        "brand": dev["brand"],
-        "model": dev["model"],
-        "product": dev["product"],
-        "device_name": dev["device"],
-        "android_version": av,
-        "sdk_version": ANDROID_SDK.get(av, "30"),
-        "serial": _rand_upper(8),
-        "imei": _rand_digits(15),
-        "fingerprint": (
-            f"{dev['brand']}/{dev['product']}/{dev['device']}:"
-            f"{av}/{_rand_upper(8)}.{_rand_digits(6)}/test-keys"
-        ),
-        "fcm_token": "".join(random.choices(fcm_chars, k=152)),
+        "brand": d["brand"],
+        "model": d["model"],
+        "android_version": d["android"],
+        "sdk_version": d["sdk"],
     }
 
 
-class GTCAuth:
+class GTCSession:
     def __init__(self):
         self.device = None
         self.token = None
@@ -91,7 +69,41 @@ class GTCAuth:
             h["Authorization"] = f"Bearer {self.token}"
         return h
 
+    def ensure_device(self):
+        if not self.device:
+            self.device = generate_device()
+        return self.device
+
+    def set_session(self, token, phone=""):
+        token = (token or "").strip()
+        if not token:
+            raise ValueError("Token/session kosong.")
+        self.ensure_device()
+        self.token = token
+        self.phone = (phone or "").strip().lstrip("+")
+        _db().save_session(self.token, self.device, self.phone)
+        return True
+
+    def restore_session(self):
+        sess = _db().load_session()
+        if not sess:
+            self.ensure_device()
+            return False
+        self.token = sess["token"]
+        self.device = sess["device"] or generate_device()
+        self.phone = sess.get("phone") or ""
+        return True
+
+    def clear(self):
+        _db().clear_session()
+        self.token = None
+        self.phone = None
+        self.device = generate_device()
+
     async def _post(self, path, payload):
+        if not self.token:
+            return {"error": True, "message": "Session GetContact belum di-set admin."}
+
         url = f"{GTC_BASE}{path}"
         async with aiohttp.ClientSession() as s:
             async with s.post(
@@ -105,83 +117,22 @@ class GTCAuth:
                     body = await r.json(content_type=None)
                 except Exception:
                     body = {"raw": await r.text()}
+
                 if not isinstance(body, dict):
                     body = {"data": body}
+
                 body.setdefault("http_status", r.status)
                 if r.status >= 400:
                     body["error"] = True
                 return body
 
-    async def register_device(self):
-        self.device = generate_device()
-        return await self._post(
-            "/user/register-device",
-            {
-                "countryCode": "ID",
-                "deviceId": self.device["device_id"],
-                "notificationToken": self.device["fcm_token"],
-                "platform": "android",
-                "systemLanguage": "id",
-            },
-        )
-
-    async def send_otp(self, phone, prefer_whatsapp=True):
-        self.phone = phone.lstrip("+")
-        payload = {
-            "phoneNumber": f"+{self.phone}",
-            "countryCode": "ID",
-            "deviceId": self.device["device_id"],
-        }
-
-        # Best-effort preference only. If unsupported, GetContact may ignore it.
-        if prefer_whatsapp:
-            payload["channel"] = "whatsapp"
-            payload["deliveryMethod"] = "whatsapp"
-
-        return await self._post("/user/send-otp", payload)
-
-    async def verify_otp(self, otp):
-        result = await self._post(
-            "/user/verify-otp",
-            {
-                "phoneNumber": f"+{self.phone}",
-                "otp": otp.strip(),
-                "deviceId": self.device["device_id"],
-                "notificationToken": self.device["fcm_token"],
-            },
-        )
-        token = (
-            result.get("token")
-            or (result.get("data") or {}).get("token")
-            or (result.get("result") or {}).get("token")
-            or result.get("access_token")
-        )
-        if token:
-            self.token = token
-            _db().save_session(token, self.device, self.phone)
-        return result
-
     async def search(self, phone):
-        if not self.token:
-            return {"error": True, "message": "Session GetContact belum aktif"}
         p = phone if phone.startswith("+") else f"+{phone}"
         return await self._post("/search", {"phoneNumber": p})
 
-    def restore_session(self):
-        sess = _db().load_session()
-        if not sess:
-            return False
-        self.token = sess["token"]
-        self.device = sess["device"]
-        self.phone = sess["phone"]
-        return True
 
-
-gtc = GTCAuth()
+gtc = GTCSession()
 
 
 def clear_session():
-    _db().clear_session()
-    gtc.token = None
-    gtc.device = None
-    gtc.phone = None
+    gtc.clear()
