@@ -1,18 +1,54 @@
 """
-db.py — PostgreSQL database via psycopg2
+db.py — PostgreSQL database via psycopg2 (Railway-safe)
 Tabel: user_usage   → limit pencarian per minggu per Telegram user
 Tabel: gtc_session  → token + device GTC
 """
 
 import json
+import os
 from datetime import date, timedelta
+from urllib.parse import urlparse
+
 import psycopg2
 import psycopg2.extras
-from config import DATABASE_URL, LIMIT_PER_USER
+
+from config import LIMIT_PER_USER
+
+
+def _database_url() -> str:
+    """Ambil koneksi PostgreSQL dari Railway dengan fallback aman."""
+    url = (os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL") or "").strip()
+    if url:
+        return url
+
+    # Fallback kalau user memilih mereferensikan PG* satu per satu di Railway.
+    host = (os.getenv("PGHOST") or "").strip()
+    port = (os.getenv("PGPORT") or "5432").strip()
+    user = (os.getenv("PGUSER") or "").strip()
+    password = os.getenv("PGPASSWORD") or ""
+    dbname = (os.getenv("PGDATABASE") or "").strip()
+
+    if host and user and dbname:
+        return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+
+    raise RuntimeError(
+        "DATABASE_URL kosong di runtime Railway. "
+        "Set DATABASE_URL sebagai reference ke ${{Postgres.DATABASE_URL}} "
+        "dan pastikan staged changes sudah di-deploy."
+    )
 
 
 def _conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    url = _database_url()
+
+    # Log aman: hanya host/database, tanpa username/password.
+    parsed = urlparse(url)
+    host = parsed.hostname or "(unknown)"
+    dbname = (parsed.path or "").lstrip("/") or "(unknown)"
+    print(f"DB connect -> host={host}, db={dbname}")
+
+    # Railway Postgres mendukung SSL. connect_timeout mencegah bot menggantung lama.
+    return psycopg2.connect(url, sslmode="require", connect_timeout=10)
 
 
 def _week_start() -> date:
@@ -50,23 +86,19 @@ def init_db():
         conn.commit()
 
 
-# ── User usage (per minggu) ───────────────────
-
 def get_user_usage(user_id: str) -> int:
-    """Ambil jumlah search user di minggu ini."""
     ws = _week_start()
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT usage FROM user_usage WHERE user_id = %s AND week_start = %s",
-                (user_id, ws)
+                (user_id, ws),
             )
             row = cur.fetchone()
             return row[0] if row else 0
 
 
 def increment_usage(user_id: str):
-    """Tambah 1 penggunaan untuk minggu ini."""
     ws = _week_start()
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -83,15 +115,13 @@ def get_remaining(user_id: str) -> int:
 
 
 def get_week_reset_info() -> tuple:
-    """Return (tanggal_reset_senin_depan, hari_tersisa)."""
-    ws          = _week_start()
+    ws = _week_start()
     next_monday = ws + timedelta(days=7)
-    days_left   = (next_monday - date.today()).days
+    days_left = (next_monday - date.today()).days
     return next_monday, days_left
 
 
 def reset_user(user_id: str):
-    """Hapus semua data usage user (admin use)."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM user_usage WHERE user_id = %s", (user_id,))
@@ -99,18 +129,15 @@ def reset_user(user_id: str):
 
 
 def get_all_users() -> dict:
-    """Ambil semua data usage minggu ini."""
     ws = _week_start()
     with _conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT user_id, usage FROM user_usage WHERE week_start = %s ORDER BY usage DESC",
-                (ws,)
+                (ws,),
             )
             return {row["user_id"]: row["usage"] for row in cur.fetchall()}
 
-
-# ── GTC Session ───────────────────────────────
 
 def save_session(token: str, device: dict, phone: str):
     with _conn() as conn:
@@ -131,8 +158,8 @@ def load_session() -> dict | None:
             if not row or not row["token"]:
                 return None
             return {
-                "token":  row["token"],
-                "phone":  row["phone"],
+                "token": row["token"],
+                "phone": row["phone"],
                 "device": row["device"],
             }
 
